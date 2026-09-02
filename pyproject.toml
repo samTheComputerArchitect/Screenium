@@ -1,0 +1,19 @@
+[project]
+name = "screenium"
+version = "0.1.0"
+description = "A lightweight screen recording application"
+requires-python = ">=3.10"
+dependencies = [
+    "dbus-python>=1.4.0",
+    "pygobject>=3.50.0",
+]
+
+[project.scripts]
+screenium = "screenrecorder:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
