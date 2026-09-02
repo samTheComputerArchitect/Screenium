@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Screenium launcher. Installed as the `screenium` command by install.sh.
+# Resolves the real project directory (traversing symlinks) and runs the
+# recorder through uv, so it always uses the project's pinned environment.
+set -euo pipefail
+
+# Resolve the directory this script actually lives in, following symlinks.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+PROJECT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+exec uv --directory "$PROJECT_DIR" run python3 screenrecorder.py "$@"
