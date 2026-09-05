@@ -53,7 +53,7 @@ your user PATH. Open a new terminal and run `screenium record`.
 
 ## Usage
 
-Screenium is a small CLI with three subcommands:
+Screenium is a small CLI with the following subcommands:
 
 ### `screenium record`
 
@@ -81,11 +81,29 @@ screenium path ~/Videos     # save recordings to ~/Videos
 Stops an active recording and saves it to disk. This can be called from any
 terminal, even if `screenium record` is not running in the current shell.
 
+### `screenium pause` / `screenium resume`
+
+Pauses and resumes an active recording without stopping it. The portal
+session stays open, so resuming does **not** re-prompt you to approve
+screen sharing.
+
+```bash
+screenium pause    # pause the recording (tray dot turns yellow)
+screenium resume   # resume the recording (tray dot turns red again)
+```
+
+Internally, pausing splits the output into segments at the nearest
+keyframe and resume opens a fresh segment. When you stop the recording,
+the paused segments are discarded and the remaining segments are merged
+into a single MP4, so the final file is a clean cut of only the content
+you recorded.
+
 ### System tray indicator
 
 While a recording is active, a red dot appears in your system tray. It
-disappears when the recording is stopped. The tray icon has a "Stop
-Recording" item that does the same thing as `screenium stop`.
+turns **yellow** while paused, red again when resumed, and disappears when
+the recording is stopped. The tray menu has Pause/Resume and Stop
+Recording options.
 
 Settings are stored in `~/.config/screenium/config.json`.
 
