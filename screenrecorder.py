@@ -13,6 +13,7 @@ Commands:
     screenium pause             pause the active recording (without stopping)
     screenium resume            resume a paused recording
     screenium toggle            toggle between paused and running
+    screenium toggle-record     start recording if idle, stop if recording
     screenium help              show this help
 """
 
@@ -391,31 +392,37 @@ def prompt_save_dir() -> Path | None:
         return path
 
 
+def _recording_pid() -> int | None:
+    """Return the PID of the running recording, or None if not recording.
+
+    Reads the PID file and validates the process is actually alive, removing
+    a stale PID file when found.
+    """
+    try:
+        pid_str = open(RECORDING_PID_FILE).read().strip()
+    except FileNotFoundError:
+        return None
+    if not pid_str:
+        return None
+    try:
+        pid = int(pid_str)
+    except ValueError:
+        RECORDING_PID_FILE.unlink(missing_ok=True)
+        return None
+    if pid <= 0 or not _alive(pid):
+        RECORDING_PID_FILE.unlink(missing_ok=True)
+        return None
+    return pid
+
+
 def _send_signal(sig: int) -> bool:
     """Send a signal to the running recording process.
 
     Returns True if the signal was dispatched, False if no recording is active.
-    Reads the recording's PID from RECORDING_PID_FILE and validates it is alive.
     """
-    pid_str = None
-    try:
-        pid_str = open(RECORDING_PID_FILE).read().strip()
-    except FileNotFoundError:
-        pass
-
-    if not pid_str:
+    pid = _recording_pid()
+    if pid is None:
         print("No recording is currently running.", file=sys.stderr)
-        return False
-
-    try:
-        pid = int(pid_str)
-        if pid <= 0 or not _alive(pid):
-            print("No recording is currently running (stale PID file).", file=sys.stderr)
-            RECORDING_PID_FILE.unlink(missing_ok=True)
-            return False
-    except ValueError:
-        print("Invalid PID file. Removing it.", file=sys.stderr)
-        RECORDING_PID_FILE.unlink(missing_ok=True)
         return False
 
     try:
@@ -462,13 +469,7 @@ def resume_recording() -> int:
 
 def toggle_recording() -> int:
     """Toggle between paused and running: pause if running, resume if paused."""
-    try:
-        pid = int(open(RECORDING_PID_FILE).read().strip())
-        if pid <= 0 or not _alive(pid):
-            print("No recording is currently running.", file=sys.stderr)
-            RECORDING_PID_FILE.unlink(missing_ok=True)
-            return 1
-    except (FileNotFoundError, ValueError):
+    if _recording_pid() is None:
         print("No recording is currently running.", file=sys.stderr)
         return 1
 
@@ -683,6 +684,8 @@ def record(save_dir: Path) -> int:
     # into the SAME splitmuxsink. Because audio lives in the same segments as
     # the video, pausing (a split + the pause segment being discarded at
     # assembly) pauses the audio too - there is no separate audio state.
+    # liveadder (instead of audiomixer) is used so an idle source (e.g. the
+    # monitor when nothing plays) does not stall the mix and cause beeps/drops.
     if audio_ok:
         srcs = []
         if monitor:
@@ -697,7 +700,7 @@ def record(save_dir: Path) -> int:
             )
         audio_chain = (
             f"{''.join(srcs)}"
-            f"audiomixer name=mix "
+            f"liveadder name=mix "
             f"mix. ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 "
             f"! {audio_encoder} ! queue ! split.audio_0"
         )
@@ -915,6 +918,13 @@ def cmd_toggle() -> int:
     return toggle_recording()
 
 
+def cmd_toggle_record() -> int:
+    """Toggle the recording itself: stop if recording, otherwise start."""
+    if _recording_pid() is not None:
+        return stop_recording()
+    return cmd_record()
+
+
 def create_tray_icon():
     """Show a tray icon while recording is active.
 
@@ -1013,6 +1023,8 @@ def main(argv=None):
         return cmd_resume()
     if sub == "toggle":
         return cmd_toggle()
+    if sub in ("toggle-record", "toggle_record"):
+        return cmd_toggle_record()
 
     print(f"Unknown command: {sub}\n", file=sys.stderr)
     print(__doc__)
