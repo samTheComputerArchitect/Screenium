@@ -9,6 +9,8 @@ Commands:
     screenium record            start recording (prompts for save path on first run)
     screenium path              show the current save location
     screenium path <DIR>        set the save location to <DIR>
+    screenium fps               show the recording framerate
+    screenium fps <N>           set the recording framerate (1-240, default 30)
     screenium stop              stop the active recording and save it
     screenium pause             pause the active recording (without stopping)
     screenium resume            resume a paused recording
@@ -77,6 +79,14 @@ class Config:
 
     def set_save_dir(self, path: Path) -> None:
         self.data["save_dir"] = str(Path(path).expanduser().resolve())
+        self._save()
+
+    def get_fps(self) -> int:
+        """Recording framerate (default 30)."""
+        return int(self.data.get("fps", 30))
+
+    def set_fps(self, fps: int) -> None:
+        self.data["fps"] = fps
         self._save()
 
 
@@ -672,9 +682,10 @@ def record(save_dir: Path) -> int:
     fd = capture.pipewire_fd
     node = capture.stream_node_id
     keyframe_arg = encoder_keyframe_arg(encoder)
+    fps = Config().get_fps()
     pipeline_str = (
         f"pipewiresrc fd={fd} path={node} do-timestamp=true "
-        f"! videoconvert ! videorate ! video/x-raw,framerate=30/1 "
+        f"! videoconvert ! videorate drop-only=true ! video/x-raw,framerate={fps}/1 "
         f"! {encoder} name=enc {keyframe_arg} ! h264parse "
         f"! splitmuxsink name=split location={seg_pattern} "
         f"max-size-time=0 max-size-bytes=0 send-keyframe-requests=true"
@@ -864,6 +875,27 @@ def cmd_path(args: list[str]) -> int:
     return 0
 
 
+def cmd_fps(args: list[str]) -> int:
+    """Handle the `fps` subcommand: show or set the recording framerate."""
+    cfg = Config()
+    if args:
+        try:
+            fps = int(args[0])
+        except ValueError:
+            print(f"Error: '{args[0]}' is not a number.", file=sys.stderr)
+            return 1
+        if fps <= 0 or fps > 240:
+            print("Error: FPS must be between 1 and 240.", file=sys.stderr)
+            return 1
+        cfg.set_fps(fps)
+        print(f"Recording framerate set to: {fps} FPS")
+        return 0
+
+    print(f"Recording framerate: {cfg.get_fps()} FPS")
+    print(f"Run 'screenium fps <N>' to change it.")
+    return 0
+
+
 def cmd_record() -> int:
     """Start recording, prompting for a save path on first run."""
     cfg = Config()
@@ -1015,6 +1047,8 @@ def main(argv=None):
         return cmd_record()
     if sub == "path":
         return cmd_path(rest)
+    if sub == "fps":
+        return cmd_fps(rest)
     if sub == "stop":
         return cmd_stop()
     if sub == "pause":
