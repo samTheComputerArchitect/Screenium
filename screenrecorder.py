@@ -111,28 +111,48 @@ class PortalCapture:
 
         from gi.repository import GLib
 
+        import dbus  # noqa: F401 - dbus.lowlevel used by the message filter
+
         request_path = str(method(*pos_args, options))
         result: dict = {"ok": False, "results": {}, "timed_out": True}
         done = threading.Event()
 
-        def on_response(response: int, results: dict) -> None:
-            result["ok"] = response == 0
-            result["results"] = results
+        def matches(path: str, member: str) -> bool:
+            # The sender is the portal's unique bus name (e.g. :1.369), so it
+            # is not compared here. The request path is unique per call, which
+            # is enough to identify our Response.
+            return member == "Response" and path == request_path
+
+        def on_message(connection, message) -> None:
+            # Route only the Response signal for the request we just made.
+            # We match on the signal's object path here instead of passing
+            # ``path=`` to add_signal_receiver, because dbus-python 1.4.0's
+            # path-filtered receivers intermittently fail to dispatch when the
+            # main context is pumped with context.iteration() (the Response
+            # signal is emitted on the bus but never reaches this process).
+            if message.get_type() != dbus.lowlevel.MESSAGE_TYPE_SIGNAL:
+                return
+            if not matches(message.get_path(), message.get_member()):
+                return
+            args = message.get_args_list()
+            if len(args) < 2:
+                return
+            code, results = args[0], args[1]
+            result["ok"] = code == 0
+            result["results"] = dict(results) if isinstance(results, dbus.Dictionary) else results
             result["timed_out"] = False
             done.set()
 
-        self.bus.add_signal_receiver(
-            on_response, "Response", REQUEST_IFACE, PORTAL_NAME, path=request_path
-        )
-        GLib.timeout_add_seconds(
-            int(timeout),
-            lambda *_: done.set(),
-        )
+        self.bus.add_message_filter(on_message)
+        try:
+            GLib.timeout_add_seconds(
+                int(timeout),
+                lambda *_: done.set(),
+            )
 
-        self._pump_until(done, timeout + 2)
-        self.bus.remove_signal_receiver(
-            on_response, "Response", REQUEST_IFACE, PORTAL_NAME
-        )
+            self._pump_until(done, timeout + 2)
+        finally:
+            self.bus.remove_message_filter(on_message)
 
         if result["timed_out"]:
             if not STOP.is_set():
@@ -248,19 +268,37 @@ def find_encoder() -> str:
 
 
 def encoder_keyframe_arg(encoder: str) -> str:
-    """Parser argument forcing a ~1s keyframe interval on ``encoder``.
+    """Parser argument forcing a short keyframe interval (~0.2s) on ``encoder``.
 
-    Pausing splits the recording on a keyframe (via splitmuxsink), so a
-    short GOP keeps pause/resume latency under a second instead of waiting
-    for the encoder's default (often 250 frames, ~8s) keyframe.
+    Pausing/resuming splits the recording on a keyframe (via splitmuxsink's
+    split-now), so a short GOP keeps pause/resume latency low and lets the
+    encoder recover cleanly after each forced split.
     """
     props = {
-        "nvh264enc": "gop-size=30",
-        "nvautogpuh264enc": "gop-size=30",
-        "vah264enc": "gop-size=30",
-        "x264enc": "key-int-max=30",
+        "nvh264enc": "gop-size=6",
+        "nvautogpuh264enc": "gop-size=6",
+        "vah264enc": "gop-size=6",
+        "x264enc": "key-int-max=6",
     }
     return props.get(encoder, "")
+
+
+def _force_keyframe(enc) -> None:
+    """Send a GstForceKeyUnit event to the encoder so it produces a keyframe
+    immediately. splitmuxsink waits for a keyframe to split on, so without
+    this the pause/resume split can lag by up to a full GOP (about a second
+    at gop-size=30 / 30fps)."""
+    import gi
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    try:
+        structure = Gst.Structure.new_empty("GstForceKeyUnit")
+        event = Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure)
+        enc.send_event(event)
+    except Exception:  # noqa: BLE001 - force keyframe is best-effort
+        pass
 
 
 def prompt_save_dir() -> Path | None:
@@ -495,6 +533,12 @@ def record(save_dir: Path) -> int:
     if not capture.start():
         return 1
 
+    # The red tray dot only appears after the user grants screen-share
+    # permission above, so it never shows while the permission dialog is up.
+    # It runs in a background thread and dies when this process exits.
+    tray_thread = threading.Thread(target=create_tray_icon, daemon=True)
+    tray_thread.start()
+
     save_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = save_dir / f"recording_{timestamp}.mp4"
@@ -513,7 +557,7 @@ def record(save_dir: Path) -> int:
     pipeline_str = (
         f"pipewiresrc fd={fd} path={node} do-timestamp=true "
         f"! videoconvert ! videorate ! video/x-raw,framerate=30/1 "
-        f"! {encoder} {keyframe_arg} ! h264parse "
+        f"! {encoder} name=enc {keyframe_arg} ! h264parse "
         f"! splitmuxsink name=split location={seg_pattern} "
         f"max-size-time=0 max-size-bytes=0 send-keyframe-requests=true"
     )
@@ -552,6 +596,7 @@ def record(save_dir: Path) -> int:
     pipe_bus.add_signal_watch()
 
     splitter = pipeline.get_by_name("split")
+    enc = pipeline.get_by_name("enc")
 
     pipeline.set_state(Gst.State.PLAYING)
     pipe_bus.connect("message", on_bus_message)
@@ -560,9 +605,9 @@ def record(save_dir: Path) -> int:
         # Pump the GLib context until told to stop (Ctrl+C or stop command).
         # Pausing does NOT change the pipeline state and never drops frames
         # mid-stream (the portal PipeWire source wedges if flow is stopped).
-        # Instead, splitmuxsink is asked to split at the next keyframe, which
-        # closes the current segment and opens a fresh one; the segment opened
-        # while "paused" is discarded when the output is assembled at stop.
+        # Instead, splitmuxsink is asked to split immediately (split-now),
+        # plus a forced keyframe, so a fresh ("paused") segment opens with
+        # almost no lag; that segment is discarded at assembly time.
         state_at_open: dict[int, bool] = {}
         last_max = -1
         while not STOP.is_set():
@@ -577,11 +622,13 @@ def record(save_dir: Path) -> int:
 
             if PAUSED.is_set() and not paused_now:
                 paused_now = True
-                splitter.emit("split-after")
+                splitter.emit("split-now")
+                _force_keyframe(enc)
                 print("Recording paused. Run 'screenium resume' to continue.")
             elif not PAUSED.is_set() and paused_now:
                 paused_now = False
-                splitter.emit("split-after")
+                splitter.emit("split-now")
+                _force_keyframe(enc)
                 print("Recording resumed.")
             now = time.monotonic()
             if now - last_beat > 5.0:
@@ -689,7 +736,8 @@ def cmd_record() -> int:
     # through gi, and doing that serially here (before record() imports the
     # GStreamer gi bindings) avoids a gi repository race that can otherwise drop
     # shared attributes (e.g. GLib.Idle) when namespaces load from two threads
-    # at once. The icon itself still runs in a daemon thread below.
+    # at once. The icon itself is started later (inside record(), only after the
+    # portal screen-share permission is granted).
     try:
         import pystray  # noqa: F401
         from PIL import Image  # noqa: F401
@@ -701,11 +749,6 @@ def cmd_record() -> int:
             file=sys.stderr,
         )
         return record(save_dir)
-
-    # Tray icon runs in a background thread; it dies when this process exits
-    # (i.e. when the recording stops), so the icon appears only while recording.
-    tray_thread = threading.Thread(target=create_tray_icon, daemon=True)
-    tray_thread.start()
 
     return record(save_dir)
 
