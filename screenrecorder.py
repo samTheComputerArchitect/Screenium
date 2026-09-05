@@ -267,6 +267,70 @@ def find_encoder() -> str:
     return ""
 
 
+def find_audio_encoder() -> str:
+    """Probe GStreamer for an available audio encoder (prefer AAC, fall back to Opus)."""
+    import gi
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    for name in ("fdkaacenc", "voaacenc", "avenc_aac", "opusenc"):
+        if Gst.ElementFactory.find(name):
+            return name
+    return ""
+
+
+def find_audio_devices() -> tuple[str | None, str | None]:
+    """Return (monitor_source, mic_source) PulseAudio device names.
+
+    The monitor is the "what you hear" source (default sink + ".monitor") and
+    the mic is the default input. Falls back to the first matching monitor/mic
+    if the defaults cannot be resolved. Either may be None if unavailable.
+    """
+    try:
+        sink = subprocess.run(
+            ["pactl", "get-default-sink"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception:
+        sink = ""
+    try:
+        mic = subprocess.run(
+            ["pactl", "get-default-source"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception:
+        mic = ""
+
+    monitor = f"{sink}.monitor" if sink else None
+    # The default source is the mic; if it is itself a monitor, it means no
+    # physical input exists, so treat it as unavailable.
+    if mic and mic.endswith(".monitor"):
+        mic = None
+
+    # Fall back to scanning when pactl gives nothing usable.
+    if not monitor or not mic:
+        try:
+            out = subprocess.run(
+                ["pactl", "list", "short", "sources"],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            if not monitor:
+                for line in out.splitlines():
+                    if ".monitor" in line:
+                        monitor = line.split("\t")[1]
+                        break
+            if not mic:
+                for line in out.splitlines():
+                    if ".monitor" not in line:
+                        mic = line.split("\t")[1]
+                        break
+        except Exception:
+            pass
+
+    return monitor, mic
+
+
 def encoder_keyframe_arg(encoder: str) -> str:
     """Parser argument forcing a short keyframe interval (~0.2s) on ``encoder``.
 
@@ -526,6 +590,20 @@ def record(save_dir: Path) -> int:
         print("Error: no H.264 encoder found in GStreamer.", file=sys.stderr)
         return 1
 
+    # Audio: detect an encoder and the system/mic sources. If any piece is
+    # missing the recording still runs video-only with a warning, rather than
+    # failing entirely.
+    audio_encoder = find_audio_encoder()
+    monitor, mic = find_audio_devices()
+    audio_ok = bool(audio_encoder) and bool(monitor or mic)
+    if audio_encoder and not (monitor or mic):
+        print(
+            "Warning: no PulseAudio devices found; recording video only.",
+            file=sys.stderr,
+        )
+    elif monitor or mic:
+        print(f"Audio: system={monitor or '(none)'} mic={mic or '(none)'} encoder={audio_encoder}")
+
     # Portal handshake (user approves dialog here)
     capture = PortalCapture(bus)
     if STOP.is_set():
@@ -561,6 +639,31 @@ def record(save_dir: Path) -> int:
         f"! splitmuxsink name=split location={seg_pattern} "
         f"max-size-time=0 max-size-bytes=0 send-keyframe-requests=true"
     )
+
+    # Audio branch: mix the system monitor and the microphone, encode, and feed
+    # into the SAME splitmuxsink. Because audio lives in the same segments as
+    # the video, pausing (a split + the pause segment being discarded at
+    # assembly) pauses the audio too - there is no separate audio state.
+    if audio_ok:
+        srcs = []
+        if monitor:
+            srcs.append(
+                f"pulsesrc name=sysaudio device={monitor} do-timestamp=true "
+                f"! audioconvert ! audioresample ! mix. "
+            )
+        if mic:
+            srcs.append(
+                f"pulsesrc name=mic device={mic} do-timestamp=true "
+                f"! audioconvert ! audioresample ! mix. "
+            )
+        audio_chain = (
+            f"{''.join(srcs)}"
+            f"audiomixer name=mix "
+            f"mix. ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 "
+            f"! {audio_encoder} ! queue ! split.audio_0"
+        )
+
+        pipeline_str += f" {audio_chain}"
 
     try:
         pipeline = Gst.parse_launch(pipeline_str)
