@@ -37,7 +37,7 @@ The installer:
 Open a new terminal, then:
 
 ```bash
-screenium
+screenium record
 ```
 
 ### Windows
@@ -49,16 +49,45 @@ install.bat
 ```
 
 This installs `screenium.cmd` into `%USERPROFILE%\.local\bin` and adds it to
-your user PATH. Open a new terminal and run `screenium`.
+your user PATH. Open a new terminal and run `screenium record`.
 
 ## Usage
 
-When you start Screenium, your desktop environment shows a dialog asking you
-to approve screen sharing. Click **Allow** to begin.
+Screenium is a small CLI with three subcommands:
+
+### `screenium record`
+
+Starts a recording. On **first run** it asks where recordings should be
+saved; your answer is remembered for future runs.
+
+When recording starts, your desktop environment shows a dialog asking you to
+approve screen sharing. Click **Allow** to begin.
 
 - **Ctrl+C** (or `kill`) stops the recording and saves it
-- Output goes to `~/tmp/recording_YYYYMMDD_HHMMSS.mp4`
+- Output goes to `<save location>/recording_YYYYMMDD_HHMMSS.mp4`
 - The recording directory is auto-created if it doesn't exist
+
+### `screenium path`
+
+Shows the current save location, or changes it:
+
+```bash
+screenium path              # show current save location
+screenium path ~/Videos     # save recordings to ~/Videos
+```
+
+### `screenium stop`
+
+Stops an active recording and saves it to disk. This can be called from any
+terminal, even if `screenium record` is not running in the current shell.
+
+### System tray indicator
+
+While a recording is active, a red dot appears in your system tray. It
+disappears when the recording is stopped. The tray icon has a "Stop
+Recording" item that does the same thing as `screenium stop`.
+
+Settings are stored in `~/.config/screenium/config.json`.
 
 If the screen-share portal fails to respond, Screenium retries a few times
 then exits with a clear message; on Linux run
@@ -93,6 +122,6 @@ README.md               this file
 Dependencies are managed exclusively with `uv` (never `pip`):
 
 ```bash
-uv add <package>        # add a dependency
-uv run python3 screenrecorder.py   # run recorder directly
+uv add pystray pillow    # add tray needed dependencies
+uv run python3 screenrecorder.py record   # run recorder directly
 ```

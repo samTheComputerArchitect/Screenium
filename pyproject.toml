@@ -6,6 +6,8 @@ requires-python = ">=3.10"
 dependencies = [
     "dbus-python>=1.4.0",
     "pygobject>=3.50.0",
+    "pystray>=0.19.5",
+    "Pillow",
 ]
 
 [project.scripts]
