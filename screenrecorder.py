@@ -12,6 +12,7 @@ Commands:
     screenium stop              stop the active recording and save it
     screenium pause             pause the active recording (without stopping)
     screenium resume            resume a paused recording
+    screenium toggle            toggle between paused and running
     screenium help              show this help
 """
 
@@ -36,6 +37,10 @@ REQUEST_IFACE = "org.freedesktop.portal.Request"
 
 # PID file path for the running recording
 RECORDING_PID_FILE = Path.home() / ".config" / "screenium" / "recording.pid"
+
+# Marks whether the active recording is paused ("1") or running ("0"), so a
+# separate `screenium toggle` process can decide pause vs resume.
+PAUSED_STATE_FILE = Path.home() / ".config" / "screenium" / "paused.state"
 
 # Set by the SIGINT/SIGTERM handler so every blocking wait can bail out fast.
 STOP = threading.Event()
@@ -430,6 +435,15 @@ def stop_recording() -> int:
     return 1
 
 
+def _write_paused_state(paused: bool) -> None:
+    """Persist the pause state so `screenium toggle` can read it."""
+    try:
+        PAUSED_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PAUSED_STATE_FILE.write_text("1" if paused else "0")
+    except OSError:
+        pass
+
+
 def pause_recording() -> int:
     """Pause the active recording without stopping it."""
     if _send_signal(signal.SIGUSR1):
@@ -444,6 +458,29 @@ def resume_recording() -> int:
         print("Resuming recording...")
         return 0
     return 1
+
+
+def toggle_recording() -> int:
+    """Toggle between paused and running: pause if running, resume if paused."""
+    try:
+        pid = int(open(RECORDING_PID_FILE).read().strip())
+        if pid <= 0 or not _alive(pid):
+            print("No recording is currently running.", file=sys.stderr)
+            RECORDING_PID_FILE.unlink(missing_ok=True)
+            return 1
+    except (FileNotFoundError, ValueError):
+        print("No recording is currently running.", file=sys.stderr)
+        return 1
+
+    try:
+        state = PAUSED_STATE_FILE.read_text().strip()
+        paused = state == "1"
+    except OSError:
+        # No state file yet means the recording is running (not paused).
+        paused = False
+    if paused:
+        return resume_recording()
+    return pause_recording()
 
 
 def _alive(pid: int) -> bool:
@@ -570,9 +607,11 @@ def record(save_dir: Path) -> int:
     # GStreamer state change happens on the main loop below.
     def on_pause(_signum, _frame):
         PAUSED.set()
+        _write_paused_state(True)
 
     def on_resume(_signum, _frame):
         PAUSED.clear()
+        _write_paused_state(False)
 
     signal.signal(signal.SIGUSR1, on_pause)
     signal.signal(signal.SIGUSR2, on_resume)
@@ -871,6 +910,11 @@ def cmd_resume() -> int:
     return resume_recording()
 
 
+def cmd_toggle() -> int:
+    """Toggle pause/resume of the active recording."""
+    return toggle_recording()
+
+
 def create_tray_icon():
     """Show a tray icon while recording is active.
 
@@ -941,6 +985,8 @@ def cleanup_on_exit():
     """Clean up on exit."""
     if RECORDING_PID_FILE.exists():
         RECORDING_PID_FILE.unlink(missing_ok=True)
+    if PAUSED_STATE_FILE.exists():
+        PAUSED_STATE_FILE.unlink(missing_ok=True)
 
 
 def main(argv=None):
@@ -965,6 +1011,8 @@ def main(argv=None):
         return cmd_pause()
     if sub == "resume":
         return cmd_resume()
+    if sub == "toggle":
+        return cmd_toggle()
 
     print(f"Unknown command: {sub}\n", file=sys.stderr)
     print(__doc__)
